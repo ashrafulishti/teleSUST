@@ -4,12 +4,9 @@
   teleSUST Real-Time Group Chat Platform
 =============================================================================
 """
-
 from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
 from database import create_tables
 from routers import auth, channels, groups, messages, websocket
 
@@ -32,9 +29,22 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+# ---------------------------------------------------------------------------
+# CORS
+# ---------------------------------------------------------------------------
+# allow_origins=["*"] is INVALID when allow_credentials=True.
+# The browser spec forbids wildcard origins on credentialed requests — it
+# silently drops the request body, FastAPI receives None, and Pydantic throws
+# "Input should be a valid dictionary or object to extract fields from."
+# Solution: list every domain the frontend is actually served from.
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://tele-sust.vercel.app",   # production frontend (Vercel)
+        "http://localhost:5173",           # local Vite dev server
+        "http://127.0.0.1:5173",           # local Vite dev server (alternate)
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

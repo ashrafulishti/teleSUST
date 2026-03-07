@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from database import create_tables
-from routers import auth, channels, groups, websocket
+from routers import auth, channels, groups, messages, websocket
 
 
 @asynccontextmanager
@@ -34,28 +34,25 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # ← tighten to your domain before production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ---------------------------------------------------------------------------
-# Routers — Phase 2 + Phase 3 + Phase 5
+# Routers
 # ---------------------------------------------------------------------------
-app.include_router(auth.router,       prefix="/auth",                   tags=["Auth"])
-app.include_router(groups.router,     prefix="/groups",                 tags=["Groups"])
+app.include_router(auth.router,      prefix="/auth",                   tags=["Auth"])
+app.include_router(groups.router,    prefix="/groups",                 tags=["Groups"])
 app.include_router(
     channels.router,
     prefix="/groups/{group_id}/channels",
     tags=["Channels"],
 )
-app.include_router(websocket.router,  prefix="/ws",                     tags=["WebSocket"])
+app.include_router(messages.router,  prefix="/messages",               tags=["Messages"])
+app.include_router(websocket.router, prefix="/ws",                     tags=["WebSocket"])
 
-
-# ---------------------------------------------------------------------------
-# Health check — Render pings this to confirm the service is alive
-# ---------------------------------------------------------------------------
 
 @app.get("/health", tags=["Health"])
 async def health_check():

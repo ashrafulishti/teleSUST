@@ -2,26 +2,41 @@
 =============================================================================
   routers/groups.py — Group management endpoints
 =============================================================================
-  POST /groups                    create a new group  (any auth user)
-  GET  /groups                    list groups the current user belongs to
-  POST /groups/{group_id}/join    verify join_password, add user to group
-=============================================================================
-  Key design notes
-  ----------------
-  • join_password is bcrypt-hashed on CREATE, verified with verify_password
-    on JOIN.  The plain-text value is never stored or returned.
-  • The creator is automatically added as the first member after creation.
-  • Joining a group you already belong to returns HTTP 409 (not silent).
-  • member_count is computed in Python from the already-loaded relationship
-    (lazy="selectin") — no extra DB query.
+  FIX: MissingGreenlet crash on POST /groups
+
+  Root cause
+  ----------
+  The original code did:
+      new_group.members.append(current_user)
+
+  new_group is a freshly-created ORM object that has never been loaded
+  from the database. When SQLAlchemy sees .append() on an unloaded
+  collection, it tries to load the existing members first (so it can
+  build the in-memory list). That fires a lazy SELECT synchronously
+  inside an async greenlet → MissingGreenlet crash.
+
+  This happens even with lazy="selectin" on the relationship, because
+  selectin only applies when the object is loaded via a query — it does
+  NOT prevent the lazy load triggered by accessing an uninitialized
+  collection on a new object.
+
+  Fix
+  ---
+  Replace the .append() call with a direct INSERT into the user_group
+  association table using db.execute(). This bypasses the relationship
+  collection entirely — no lazy load is triggered, no collection needs
+  to be initialized, and the row is inserted cleanly.
+
+  Same fix applied to join_group() for the same reason.
 =============================================================================
 """
 
 import uuid
+from datetime import datetime, timezone
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
@@ -40,10 +55,8 @@ router = APIRouter()
 
 
 # ---------------------------------------------------------------------------
-# Helper — ORM Group  →  GroupResponse
+# Helper — ORM Group → GroupResponse
 # ---------------------------------------------------------------------------
-# member_count can't be set via from_attributes because it isn't a column,
-# so we build the response manually every time.
 
 def _group_to_response(group: Group) -> GroupResponse:
     return GroupResponse(
@@ -53,7 +66,7 @@ def _group_to_response(group: Group) -> GroupResponse:
         is_read_only  = group.is_read_only,
         created_by_id = group.created_by_id,
         created_at    = group.created_at,
-        member_count  = len(group.members),   # relationship is selectin-loaded
+        member_count  = len(group.members),
     )
 
 
@@ -89,17 +102,9 @@ async def create_group(
 ) -> GroupResponse:
     """
     Create a new group and immediately add the creator as its first member.
-
-    Steps
-    -----
-    1. Reject duplicate group names → HTTP 409
-    2. Hash the plain-text join_password with bcrypt
-    3. Persist the Group row
-    4. Insert the creator into user_group (the M2M association table)
-    5. Refresh and return GroupResponse
     """
 
-    # ── 1. Duplicate name check ───────────────────────────────────────────────
+    # ── 1. Duplicate name check ───────────────────────────────────────────
     existing = await db.execute(select(Group).where(Group.name == body.name))
     if existing.scalar_one_or_none():
         raise HTTPException(
@@ -107,21 +112,31 @@ async def create_group(
             detail=f"A group named '{body.name}' already exists.",
         )
 
-    # ── 2 + 3. Hash password and persist ─────────────────────────────────────
+    # ── 2. Hash password and persist group ────────────────────────────────
     new_group = Group(
         name          = body.name,
         description   = body.description,
-        join_password = hash_password(body.join_password),  # ← NEVER store plain text
+        join_password = hash_password(body.join_password),
         is_read_only  = body.is_read_only,
         created_by_id = current_user.id,
     )
     db.add(new_group)
-    await db.flush()          # populates new_group.id before the relationship insert
+    await db.flush()   # populates new_group.id before the association insert
 
-    # ── 4. Auto-join creator ──────────────────────────────────────────────────
-    # Append directly to the ORM relationship — SQLAlchemy writes the
-    # user_group association row on flush/commit automatically.
-    new_group.members.append(current_user)
+    # ── 3. Auto-join creator ──────────────────────────────────────────────
+    # FIX: Direct INSERT into the association table instead of using
+    # new_group.members.append(current_user).
+    #
+    # .append() on a freshly-created (never DB-loaded) object triggers a
+    # lazy SELECT to initialise the collection → MissingGreenlet in async.
+    # A direct INSERT bypasses the relationship collection entirely.
+    await db.execute(
+        insert(user_group_association).values(
+            user_id  = current_user.id,
+            group_id = new_group.id,
+            joined_at = datetime.now(timezone.utc),
+        )
+    )
 
     await db.flush()
     await db.refresh(new_group)
@@ -144,11 +159,7 @@ async def list_my_groups(
 ) -> GroupListResponse:
     """
     Return every group the authenticated user belongs to.
-
-    The User.groups relationship (lazy="selectin") is already loaded by
-    get_current_user, so this endpoint requires no additional DB queries.
     """
-    # Refresh to ensure the selectin relationship is populated in this session
     await db.refresh(current_user)
 
     group_responses: List[GroupResponse] = [
@@ -178,23 +189,12 @@ async def join_group(
 ) -> GroupJoinResponse:
     """
     Add the current user to a group after verifying the join password.
-
-    Steps
-    -----
-    1. Fetch the group or 404
-    2. Check the user isn't already a member → HTTP 409
-    3. Verify plain-text body.join_password against Group.join_password
-       using verify_password() (bcrypt constant-time comparison)
-       Wrong password → HTTP 403  (not 401 — user IS authenticated,
-                                    they just supplied the wrong group key)
-    4. Append user to group.members (writes user_group row on commit)
-    5. Return GroupJoinResponse
     """
 
-    # ── 1. Fetch group ────────────────────────────────────────────────────────
+    # ── 1. Fetch group ────────────────────────────────────────────────────
     group = await _get_group_or_404(group_id, db)
 
-    # ── 2. Already a member? ──────────────────────────────────────────────────
+    # ── 2. Already a member? ──────────────────────────────────────────────
     already_member = any(m.id == current_user.id for m in group.members)
     if already_member:
         raise HTTPException(
@@ -202,19 +202,27 @@ async def join_group(
             detail="You are already a member of this group.",
         )
 
-    # ── 3. Verify join password ───────────────────────────────────────────────
+    # ── 3. Verify join password ───────────────────────────────────────────
     if not verify_password(body.join_password, group.join_password):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Incorrect group password.",
         )
 
-    # ── 4. Add member ─────────────────────────────────────────────────────────
-    group.members.append(current_user)
+    # ── 4. Add member ─────────────────────────────────────────────────────
+    # FIX: same as create_group — direct INSERT avoids lazy collection load.
+    await db.execute(
+        insert(user_group_association).values(
+            user_id   = current_user.id,
+            group_id  = group.id,
+            joined_at = datetime.now(timezone.utc),
+        )
+    )
+
     await db.flush()
     await db.refresh(group)
 
-    # ── 5. Return ─────────────────────────────────────────────────────────────
+    # ── 5. Return ─────────────────────────────────────────────────────────
     return GroupJoinResponse(
         group=_group_to_response(group)
     )

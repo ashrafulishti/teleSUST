@@ -1,19 +1,19 @@
 # Core framework
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.6
 
 # Database
-sqlalchemy==2.0.36
+sqlalchemy>=2.0.36
 asyncpg>=0.30.0           # Async PostgreSQL driver (Neon)
 
 # Auth
-passlib[bcrypt]==1.7.4    # Password hashing
+passlib[bcrypt]>=1.7.4    # Password hashing
 bcrypt==4.0.1             # ⚠️ PIN THIS. bcrypt ≥4.1 breaks passlib 1.7.4 on
                           # Python 3.12 (removed __about__ attribute).
                           # See utils/security.py for the monkey-patch fix.
-python-jose[cryptography]==3.3.0  # JWT signing/verification
+python-jose[cryptography]>=3.3.0  # JWT signing/verification
 
 # Validation
-pydantic==2.9.2
-email-validator==2.2.0    # EmailStr support
-python-dotenv==1.0.1      # Load .env in development
+pydantic>=2.9.2
+email-validator>=2.2.0    # EmailStr support
+python-dotenv>=1.0.1      # Load .env in development

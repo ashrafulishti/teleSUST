@@ -1,58 +1,12 @@
 """
 =============================================================================
   REAL-TIME GROUP CHAT PLATFORM — DATABASE MODELS
+  Stack: FastAPI + SQLAlchemy (async) + PostgreSQL (Neon)
 =============================================================================
-  FIX: MissingGreenlet crash on group creation (and anywhere else a
-  relationship is accessed in an async context).
-
-  Root cause
-  ----------
-  SQLAlchemy's default lazy loading strategy is lazy="select", which fires
-  a synchronous SELECT when a relationship attribute is first accessed.
-  In an async SQLAlchemy app this raises:
-
-      MissingGreenlet: greenlet_spawn has not been called;
-      can't call await_only() here.
-
-  because the sync DB call has no async greenlet to run inside.
-
-  The original models.py had:
-    • Channel.group      — no lazy= specified → defaults to lazy="select" ← CRASH
-    • Channel.messages   — no lazy= specified → defaults to lazy="select" ← CRASH
-    • Message.channel    — no lazy= specified → defaults to lazy="select" ← CRASH
-    • Group.created_by   — lazy="joined"  (sync JOIN)                     ← CRASH
-    • Message.author     — lazy="joined"  (sync JOIN)                     ← CRASH on
-                           some SQLAlchemy versions when session is closed
-
-  Fix applied
-  -----------
-  Every relationship now has an explicit async-safe lazy strategy:
-
-    lazy="selectin"  — fires a separate async SELECT IN query.
-                       Used for all to-one and to-many relationships that
-                       need to be loaded with the parent object.
-
-    lazy="joined"    → replaced with lazy="selectin" everywhere except
-                       Message.author, where we keep "joined" BUT only
-                       access it inside an open async session (websocket.py
-                       _fetch_history already does this correctly).
-                       To be safe, Message.author is also changed to
-                       "selectin" so it never fires a sync load.
-
-    lazy="dynamic"   — kept on User.messages and Channel.messages because
-                       those relationships are never iterated directly;
-                       they're only used as a base for explicit queries.
-                       dynamic is a query-only strategy and never fires
-                       an implicit load, so it is async-safe.
-
-  Summary of changes
-  ------------------
-  Channel.group      lazy="selectin"   (was unset → "select")
-  Channel.messages   lazy="dynamic"    (was unset → "select")
-  Message.author     lazy="selectin"   (was "joined")
-  Message.channel    lazy="selectin"   (was unset → "select")
-  Group.created_by   lazy="selectin"   (was "joined")
-  All others         unchanged
+  Phase 6 changes (Message model only):
+    + is_edited  Boolean  default False  — set True on every PUT /messages
+    + updated_at DateTime nullable       — timestamp of last edit
+  All other models are unchanged.
 =============================================================================
 """
 
@@ -78,6 +32,7 @@ from sqlalchemy.sql import func
 # ---------------------------------------------------------------------------
 
 class Base(DeclarativeBase):
+    """Shared declarative base for all models."""
     pass
 
 
@@ -114,6 +69,15 @@ user_group_association = Table(
 # ---------------------------------------------------------------------------
 
 class User(Base):
+    """
+    Represents a registered user.
+
+    Relationships
+    -------------
+    • groups   : Many-to-Many via user_group_association
+    • messages : One-to-Many
+    """
+
     __tablename__ = "users"
 
     id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
@@ -134,13 +98,13 @@ class User(Base):
         "Group",
         secondary=user_group_association,
         back_populates="members",
-        lazy="selectin",        # async-safe: fires SELECT IN
+        lazy="selectin",
     )
     messages = relationship(
         "Message",
         back_populates="author",
         cascade="all, delete-orphan",
-        lazy="dynamic",         # never implicitly loaded; query-only
+        lazy="dynamic",
     )
 
     def __repr__(self) -> str:
@@ -152,6 +116,15 @@ class User(Base):
 # ---------------------------------------------------------------------------
 
 class Group(Base):
+    """
+    A top-level community space (e.g. "Study", "Announcement", "Off-Topic").
+
+    Relationships
+    -------------
+    • members  : Many-to-Many → User
+    • channels : One-to-Many  → Channel
+    """
+
     __tablename__ = "groups"
 
     id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
@@ -162,24 +135,9 @@ class Group(Base):
     created_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at    = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    members = relationship(
-        "User",
-        secondary=user_group_association,
-        back_populates="groups",
-        lazy="selectin",        # async-safe
-    )
-    channels = relationship(
-        "Channel",
-        back_populates="group",
-        cascade="all, delete-orphan",
-        lazy="selectin",        # async-safe
-    )
-    # FIX: was lazy="joined" (sync) → now lazy="selectin" (async-safe)
-    created_by = relationship(
-        "User",
-        foreign_keys=[created_by_id],
-        lazy="selectin",
-    )
+    members    = relationship("User",    secondary=user_group_association, back_populates="groups",   lazy="selectin")
+    channels   = relationship("Channel", back_populates="group", cascade="all, delete-orphan",        lazy="selectin")
+    created_by = relationship("User",    foreign_keys=[created_by_id],                                lazy="selectin")
 
     def __repr__(self) -> str:
         return f"<Group id={self.id} name={self.name!r}>"
@@ -190,6 +148,15 @@ class Group(Base):
 # ---------------------------------------------------------------------------
 
 class Channel(Base):
+    """
+    A sub-space inside a Group where messages are posted.
+
+    Relationships
+    -------------
+    • group    : Many-to-One → Group
+    • messages : One-to-Many → Message
+    """
+
     __tablename__ = "channels"
 
     id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
@@ -198,18 +165,8 @@ class Channel(Base):
     group_id   = Column(UUID(as_uuid=True), ForeignKey("groups.id", ondelete="CASCADE"), nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    # FIX: both were unset → defaulted to lazy="select" (sync) → MissingGreenlet
-    group = relationship(
-        "Group",
-        back_populates="channels",
-        lazy="selectin",        # async-safe
-    )
-    messages = relationship(
-        "Message",
-        back_populates="channel",
-        cascade="all, delete-orphan",
-        lazy="dynamic",         # never implicitly loaded; query-only
-    )
+    group    = relationship("Group",   back_populates="channels",                                lazy="selectin")
+    messages = relationship("Message", back_populates="channel", cascade="all, delete-orphan",   lazy="dynamic")
 
     def __repr__(self) -> str:
         return f"<Channel id={self.id} name={self.name!r} group_id={self.group_id}>"
@@ -220,34 +177,44 @@ class Channel(Base):
 # ---------------------------------------------------------------------------
 
 class Message(Base):
+    """
+    A single chat message sent by a User inside a Channel.
+
+    Phase 6 additions
+    -----------------
+    is_edited  : set to True whenever content is updated via PUT /messages
+    updated_at : UTC timestamp of the most recent edit; None until first edit
+
+    Relationships
+    -------------
+    • author  : Many-to-One → User
+    • channel : Many-to-One → Channel
+    """
+
     __tablename__ = "messages"
 
     id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
     content    = Column(Text, nullable=False)
 
+    # ── Lifecycle flags ───────────────────────────────────────────────────────
     is_deleted = Column(Boolean, nullable=False, default=False)
+    # edited_at is the ORIGINAL field kept from Phase 5 (backward compat)
     edited_at  = Column(DateTime(timezone=True), nullable=True)
+
+    # ── Phase 6: new fields ───────────────────────────────────────────────────
     is_edited  = Column(Boolean, nullable=False, default=False,
                         comment="True after the message has been edited at least once.")
     updated_at = Column(DateTime(timezone=True), nullable=True,
                         comment="UTC timestamp of the most recent edit.")
 
+    # ── Foreign Keys ──────────────────────────────────────────────────────────
     author_id  = Column(UUID(as_uuid=True), ForeignKey("users.id",    ondelete="SET NULL"),  nullable=True,  index=True)
     channel_id = Column(UUID(as_uuid=True), ForeignKey("channels.id", ondelete="CASCADE"),   nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False,  index=True)
 
-    # FIX: was lazy="joined" (sync JOIN) → now lazy="selectin" (async-safe)
-    author = relationship(
-        "User",
-        back_populates="messages",
-        lazy="selectin",
-    )
-    # FIX: was unset → lazy="select" (sync) → now lazy="selectin" (async-safe)
-    channel = relationship(
-        "Channel",
-        back_populates="messages",
-        lazy="selectin",
-    )
+    # ── Relationships ─────────────────────────────────────────────────────────
+    author  = relationship("User",    back_populates="messages", lazy="selectin")
+    channel = relationship("Channel", back_populates="messages", lazy="selectin")
 
     def __repr__(self) -> str:
         return (

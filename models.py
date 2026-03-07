@@ -3,10 +3,24 @@
   REAL-TIME GROUP CHAT PLATFORM — DATABASE MODELS
   Stack: FastAPI + SQLAlchemy (async) + PostgreSQL (Neon)
 =============================================================================
-  Phase 6 changes (Message model only):
-    + is_edited  Boolean  default False  — set True on every PUT /messages
-    + updated_at DateTime nullable       — timestamp of last edit
-  All other models are unchanged.
+  FIX: Group.created_by relationship changed from lazy="joined" to
+       lazy="selectin".
+
+  lazy="joined" triggers a synchronous SQL JOIN when the relationship is
+  first accessed. In an async SQLAlchemy context this causes:
+
+      sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called;
+      can't call await_only() here.
+
+  because SQLAlchemy tries to fire a sync DB call inside an async greenlet.
+
+  lazy="selectin" instead fires a separate async SELECT IN query, which
+  is fully compatible with async sessions and is the correct strategy for
+  all relationships in an async SQLAlchemy app.
+
+  Note: created_by is never actually used in any response — _group_to_response()
+  in groups.py only reads columns, not relationships. But the relationship
+  still loads on Group access, so it must be async-safe.
 =============================================================================
 """
 
@@ -32,7 +46,6 @@ from sqlalchemy.sql import func
 # ---------------------------------------------------------------------------
 
 class Base(DeclarativeBase):
-    """Shared declarative base for all models."""
     pass
 
 
@@ -69,18 +82,9 @@ user_group_association = Table(
 # ---------------------------------------------------------------------------
 
 class User(Base):
-    """
-    Represents a registered user.
-
-    Relationships
-    -------------
-    • groups   : Many-to-Many via user_group_association
-    • messages : One-to-Many
-    """
-
     __tablename__ = "users"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
+    id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
     username        = Column(String(50),  unique=True, nullable=False, index=True)
     email           = Column(String(255), unique=True, nullable=False, index=True)
     hashed_password = Column(String(255), nullable=False)
@@ -116,15 +120,6 @@ class User(Base):
 # ---------------------------------------------------------------------------
 
 class Group(Base):
-    """
-    A top-level community space (e.g. "Study", "Announcement", "Off-Topic").
-
-    Relationships
-    -------------
-    • members  : Many-to-Many → User
-    • channels : One-to-Many  → Channel
-    """
-
     __tablename__ = "groups"
 
     id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
@@ -137,7 +132,10 @@ class Group(Base):
 
     members  = relationship("User",    secondary=user_group_association, back_populates="groups",   lazy="selectin")
     channels = relationship("Channel", back_populates="group", cascade="all, delete-orphan",        lazy="selectin")
-    created_by = relationship("User",  foreign_keys=[created_by_id],                                lazy="joined")
+
+    # FIX: was lazy="joined" — synchronous JOIN load crashes in async context
+    # with MissingGreenlet. Changed to lazy="selectin" which is async-safe.
+    created_by = relationship("User", foreign_keys=[created_by_id], lazy="selectin")
 
     def __repr__(self) -> str:
         return f"<Group id={self.id} name={self.name!r}>"
@@ -148,15 +146,6 @@ class Group(Base):
 # ---------------------------------------------------------------------------
 
 class Channel(Base):
-    """
-    A sub-space inside a Group where messages are posted.
-
-    Relationships
-    -------------
-    • group    : Many-to-One → Group
-    • messages : One-to-Many → Message
-    """
-
     __tablename__ = "channels"
 
     id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
@@ -177,42 +166,22 @@ class Channel(Base):
 # ---------------------------------------------------------------------------
 
 class Message(Base):
-    """
-    A single chat message sent by a User inside a Channel.
-
-    Phase 6 additions
-    -----------------
-    is_edited  : set to True whenever content is updated via PUT /messages
-    updated_at : UTC timestamp of the most recent edit; None until first edit
-
-    Relationships
-    -------------
-    • author  : Many-to-One → User
-    • channel : Many-to-One → Channel
-    """
-
     __tablename__ = "messages"
 
     id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
     content    = Column(Text, nullable=False)
 
-    # ── Lifecycle flags ───────────────────────────────────────────────────────
     is_deleted = Column(Boolean, nullable=False, default=False)
-    # edited_at is the ORIGINAL field kept from Phase 5 (backward compat)
     edited_at  = Column(DateTime(timezone=True), nullable=True)
-
-    # ── Phase 6: new fields ───────────────────────────────────────────────────
     is_edited  = Column(Boolean, nullable=False, default=False,
                         comment="True after the message has been edited at least once.")
     updated_at = Column(DateTime(timezone=True), nullable=True,
                         comment="UTC timestamp of the most recent edit.")
 
-    # ── Foreign Keys ──────────────────────────────────────────────────────────
     author_id  = Column(UUID(as_uuid=True), ForeignKey("users.id",    ondelete="SET NULL"),  nullable=True,  index=True)
     channel_id = Column(UUID(as_uuid=True), ForeignKey("channels.id", ondelete="CASCADE"),   nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False,  index=True)
 
-    # ── Relationships ─────────────────────────────────────────────────────────
     author  = relationship("User",    back_populates="messages", lazy="joined")
     channel = relationship("Channel", back_populates="messages")
 

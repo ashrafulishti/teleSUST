@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from database import create_tables
-from routers import auth                   # ← Phase 2: Auth now live
+from routers import auth, channels, groups
 
 
 @asynccontextmanager
@@ -41,16 +41,21 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# Routers
+# Routers — Phase 2 + Phase 3
 # ---------------------------------------------------------------------------
-app.include_router(auth.router, prefix="/auth", tags=["Auth"])
+app.include_router(auth.router,     prefix="/auth",                   tags=["Auth"])
+app.include_router(groups.router,   prefix="/groups",                 tags=["Groups"])
+app.include_router(
+    channels.router,
+    prefix="/groups/{group_id}/channels",   # channels are nested under their group
+    tags=["Channels"],
+)
 
 # Uncomment as you build each Phase:
-# from routers import groups, channels, messages, websocket
-# app.include_router(groups.router,    prefix="/groups",    tags=["Groups"])
-# app.include_router(channels.router,  prefix="/channels",  tags=["Channels"])
-# app.include_router(messages.router,  prefix="/messages",  tags=["Messages"])
-# app.include_router(websocket.router, prefix="/ws",        tags=["WebSocket"])
+# from routers import messages, websocket
+# app.include_router(messages.router, prefix="/messages", tags=["Messages"])
+# app.include_router(websocket.router, prefix="/ws",      tags=["WebSocket"])
+
 
 # ---------------------------------------------------------------------------
 # Health check — Render pings this to confirm the service is alive

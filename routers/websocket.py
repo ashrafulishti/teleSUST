@@ -2,34 +2,25 @@
 =============================================================================
   routers/websocket.py — Real-time messaging + User Presence
 =============================================================================
-  Endpoint:
-    WS  /ws/{channel_id}/{token}
+  FIX (Bug 10): _evict() now properly cleans up _user_channels.
 
-  Phase 6 additions
-  -----------------
-  Presence tracking in ConnectionManager:
-    _user_channels : dict[user_id_str → set[channel_id_str]]
-      Tracks every channel a user is currently connected to.
-      On connect: add channel, broadcast status_update "online" to the
-                  channel if this is the user's FIRST connection anywhere.
-      On disconnect: remove channel, broadcast status_update "offline" to
-                     the channel if this was the user's LAST connection.
+  The old _evict() only removed the dead socket from _rooms and
+  _user_sockets, but never touched _user_channels. This meant:
 
-  broadcast_to_user_groups():
-    Fired on connect/disconnect to notify ALL channels the user is in,
-    not just the one they're joining — so every open tab/window updates.
+    • A user with a dead socket in channel X still had X in
+      _user_channels[uid], so online_user_ids(X) would keep
+      reporting them as present even after they'd gone.
+    • _user_channels entries for users with no remaining sockets
+      were never pruned — a slow memory leak over time.
 
-  The manager singleton is imported by routers/messages.py to broadcast
-  edit and delete events without re-implementing the send logic.
+  Fix: after discarding the socket from _user_sockets, for every
+  channel entry in _user_channels[uid] we check whether the user
+  still has a live socket in that channel's room. If not, we remove
+  that channel from _user_channels[uid]. Finally, if _user_channels[uid]
+  is now empty we delete the key entirely.
 
-  Wire protocol additions (server → client):
-    {
-      "type":      "status_update",
-      "user_id":   "<uuid>",
-      "username":  "alice",
-      "status":    "online" | "offline",
-      "channel_id":"<uuid>"
-    }
+  This mirrors the same logic already used in disconnect(), making
+  _evict a proper "silent disconnect" that leaves no stale state.
 =============================================================================
 """
 
@@ -87,9 +78,9 @@ class ConnectionManager:
     """
 
     def __init__(self) -> None:
-        self._rooms:          Dict[str, Set[WebSocket]] = defaultdict(set)
-        self._user_channels:  Dict[str, Set[str]]       = defaultdict(set)
-        self._user_sockets:   Dict[str, Set[WebSocket]] = defaultdict(set)
+        self._rooms:         Dict[str, Set[WebSocket]] = defaultdict(set)
+        self._user_channels: Dict[str, Set[str]]       = defaultdict(set)
+        self._user_sockets:  Dict[str, Set[WebSocket]] = defaultdict(set)
 
     # ── Connection lifecycle ──────────────────────────────────────────────────
 
@@ -106,7 +97,6 @@ class ConnectionManager:
         -------
         bool : True if this is the user's first connection (was offline),
                False if they were already online in another channel/tab.
-               Callers use this to decide whether to broadcast "online".
         """
         await ws.accept()
 
@@ -161,7 +151,8 @@ class ConnectionManager:
 
         exclude : skip this socket (pass the sender's ws to avoid echo,
                   or None to send to everyone including the sender).
-        Dead sockets are evicted silently.
+        Dead sockets are evicted via _evict() which now fully cleans up
+        all three internal structures.
         """
         recipients = list(self._rooms.get(channel_id, set()))
         if not recipients:
@@ -190,9 +181,6 @@ class ConnectionManager:
 
         Used for presence events so all of a user's open chat windows
         receive the status_update simultaneously.
-
-        exclude_channel : skip one channel (to avoid double-sending when
-                          the caller already broadcast to it directly).
         """
         channels = set(self._user_channels.get(user_id, set()))
         tasks = []
@@ -216,9 +204,6 @@ class ConnectionManager:
     def online_user_ids(self, channel_id: str) -> list[str]:
         """
         Return the user_ids of every user currently in a channel room.
-
-        Note: this is O(n_sockets) — fine for ~100 users, but if scale
-        grows you'd maintain a reverse map instead.
         """
         result = []
         for uid, sockets in self._user_sockets.items():
@@ -234,12 +219,59 @@ class ConnectionManager:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _evict(self, channel_id: str, ws: WebSocket) -> None:
-        """Remove a dead socket without triggering presence broadcasts."""
+        """
+        Silently remove a dead socket without triggering presence broadcasts.
+
+        FIX: Now fully cleans up all three internal structures:
+
+          1. Remove ws from _rooms[channel_id]. Delete key if room is empty.
+
+          2. Find which user owns this socket by scanning _user_sockets,
+             remove the socket from their set.
+
+          3. For every channel in _user_channels[uid], check whether the
+             user still has at least one live socket in that room. If not,
+             remove the channel from _user_channels[uid].
+             If _user_channels[uid] is now empty, delete the key.
+
+          4. If _user_sockets[uid] is now empty, delete the key.
+
+        This guarantees _user_channels never references a channel the user
+        is no longer actually connected to, which was the root cause of the
+        stale presence bug.
+        """
+        # Step 1 — remove socket from room
         self._rooms[channel_id].discard(ws)
         if not self._rooms[channel_id]:
             del self._rooms[channel_id]
+
+        # Step 2 — find the owning user and remove the socket
+        owning_uid: str | None = None
         for uid, socks in list(self._user_sockets.items()):
-            socks.discard(ws)
+            if ws in socks:
+                socks.discard(ws)
+                owning_uid = uid
+                break
+
+        if owning_uid is None:
+            # Socket wasn't tracked — nothing more to do
+            return
+
+        # Step 3 — prune _user_channels: remove any channel where this
+        # user no longer has a live socket in the room
+        channels = self._user_channels.get(owning_uid)
+        if channels:
+            stale = {
+                ch for ch in channels
+                if not (self._user_sockets.get(owning_uid, set()) & self._rooms.get(ch, set()))
+            }
+            channels -= stale
+            if not channels:
+                del self._user_channels[owning_uid]
+
+        # Step 4 — prune _user_sockets if empty
+        if not self._user_sockets.get(owning_uid):
+            self._user_sockets.pop(owning_uid, None)
 
 
 # Module-level singleton — imported by routers/messages.py
@@ -356,7 +388,7 @@ async def websocket_endpoint(
     """
     channel_id_str = str(channel_id)
 
-    # ── Auth + membership gate (before accept) ─────────────────────────────
+    # ── Auth + membership gate (before accept) ────────────────────────────
     async with AsyncSessionLocal() as db:
         user = await _authenticate_ws(token, db)
         if user is None:
@@ -374,20 +406,20 @@ async def websocket_endpoint(
             await ws.close(code=4003, reason="You are not a member of this group.")
             return
 
-        # ── Accept + register ───────────────────────────────────────────────
+        # ── Accept + register ─────────────────────────────────────────────
         user_id_str     = str(user.id)
         author_username = user.username
 
         is_first_connection = await manager.connect(channel_id_str, user_id_str, ws)
 
-        # ── Replay history to this client only ─────────────────────────────
+        # ── Replay history to this client only ────────────────────────────
         history = await _fetch_history(channel_id, db)
         for entry in history:
             await manager.send_personal(ws, entry)
 
-    # ── Auth session closed — no DB held open ──────────────────────────────
+    # ── Auth session closed — no DB held open ────────────────────────────
 
-    # ── Presence: broadcast "online" if this was the user's first socket ──
+    # ── Presence: broadcast "online" if this was the user's first socket ─
     presence_payload = {
         "type":       "status_update",
         "user_id":    user_id_str,
@@ -396,22 +428,19 @@ async def websocket_endpoint(
         "channel_id": channel_id_str,
     }
     if is_first_connection:
-        # Notify this channel immediately
         await manager.broadcast(channel_id_str, presence_payload, exclude=ws)
-        # Also notify any other channels the user might already be in
-        # (e.g. they had another tab open and this is a second channel)
         await manager.broadcast_to_user_groups(
             user_id_str, presence_payload, exclude_channel=channel_id_str
         )
 
-    # ── System join message ────────────────────────────────────────────────
+    # ── System join message ───────────────────────────────────────────────
     await manager.broadcast(
         channel_id_str,
         payload={"type": "system", "content": f"{author_username} has joined the channel."},
         exclude=ws,
     )
 
-    # ── Main message loop ──────────────────────────────────────────────────
+    # ── Main message loop ─────────────────────────────────────────────────
     try:
         while True:
             raw     = await ws.receive_text()
@@ -459,7 +488,7 @@ async def websocket_endpoint(
             exclude=None,
         )
 
-        # ── Presence: broadcast "offline" only when truly last connection ──
+        # ── Presence: broadcast "offline" only when truly last connection ─
         if is_now_offline:
             offline_payload = {
                 "type":       "status_update",

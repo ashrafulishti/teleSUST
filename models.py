@@ -1,7 +1,12 @@
 """
 =============================================================================
-  REAL-TIME GROUP CHAT PLATFORM — DATABASE MODELS (Phase 1)
+  REAL-TIME GROUP CHAT PLATFORM — DATABASE MODELS
   Stack: FastAPI + SQLAlchemy (async) + PostgreSQL (Neon)
+=============================================================================
+  Phase 6 changes (Message model only):
+    + is_edited  Boolean  default False  — set True on every PUT /messages
+    + updated_at DateTime nullable       — timestamp of last edit
+  All other models are unchanged.
 =============================================================================
 """
 
@@ -13,7 +18,6 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
-    Integer,
     String,
     Table,
     Text,
@@ -35,9 +39,6 @@ class Base(DeclarativeBase):
 # ---------------------------------------------------------------------------
 # Association Table  —  User ↔ Group  (Many-to-Many)
 # ---------------------------------------------------------------------------
-# A user can belong to many groups; a group can have many users.
-# This join table lives between them and carries no extra columns,
-# so a plain Table object (not a full model class) is the right choice.
 
 user_group_association = Table(
     "user_group",
@@ -74,46 +75,30 @@ class User(Base):
     Relationships
     -------------
     • groups   : Many-to-Many via user_group_association
-                 A user can be a member of multiple groups.
     • messages : One-to-Many
-                 A user can author many messages.
     """
 
     __tablename__ = "users"
 
-    id = Column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
-        nullable=False,
-    )
-    username = Column(String(50), unique=True, nullable=False, index=True)
-    email = Column(String(255), unique=True, nullable=False, index=True)
-
-    # Stored as a bcrypt hash — NEVER store plain text passwords.
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
+    username        = Column(String(50),  unique=True, nullable=False, index=True)
+    email           = Column(String(255), unique=True, nullable=False, index=True)
     hashed_password = Column(String(255), nullable=False)
-
-    # Grants access to admin-only API routes when True.
-    is_admin = Column(Boolean, nullable=False, default=False)
-
-    is_active = Column(Boolean, nullable=False, default=True)
-
-    created_at = Column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
-    )
-    updated_at = Column(
+    is_admin        = Column(Boolean, nullable=False, default=False)
+    is_active       = Column(Boolean, nullable=False, default=True)
+    created_at      = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at      = Column(
         DateTime(timezone=True),
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
     )
 
-    # ── Relationships ────────────────────────────────────────────────────────
     groups = relationship(
         "Group",
         secondary=user_group_association,
         back_populates="members",
-        lazy="selectin",       # async-friendly eager load
+        lazy="selectin",
     )
     messages = relationship(
         "Message",
@@ -136,52 +121,23 @@ class Group(Base):
 
     Relationships
     -------------
-    • members  : Many-to-Many → User  (via user_group_association)
-    • channels : One-to-Many → Channel
-                 Every group owns one or more channels (e.g. #general).
+    • members  : Many-to-Many → User
+    • channels : One-to-Many  → Channel
     """
 
     __tablename__ = "groups"
 
-    id = Column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
-        nullable=False,
-    )
-    name = Column(String(100), unique=True, nullable=False, index=True)
-    description = Column(Text, nullable=True)
-
-    # Hashed at the service layer (bcrypt) before being stored.
-    # Users must supply the correct plain-text value to join.
+    id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
+    name          = Column(String(100), unique=True, nullable=False, index=True)
+    description   = Column(Text, nullable=True)
     join_password = Column(String(255), nullable=False)
+    is_read_only  = Column(Boolean, nullable=False, default=False)
+    created_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    # When True only admins can post; useful for "Announcement" groups.
-    is_read_only = Column(Boolean, nullable=False, default=False)
-
-    created_by_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    created_at = Column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
-    )
-
-    # ── Relationships ────────────────────────────────────────────────────────
-    members = relationship(
-        "User",
-        secondary=user_group_association,
-        back_populates="groups",
-        lazy="selectin",
-    )
-    channels = relationship(
-        "Channel",
-        back_populates="group",
-        cascade="all, delete-orphan",
-        lazy="selectin",
-    )
-    created_by = relationship("User", foreign_keys=[created_by_id], lazy="joined")
+    members  = relationship("User",    secondary=user_group_association, back_populates="groups",   lazy="selectin")
+    channels = relationship("Channel", back_populates="group", cascade="all, delete-orphan",        lazy="selectin")
+    created_by = relationship("User",  foreign_keys=[created_by_id],                                lazy="joined")
 
     def __repr__(self) -> str:
         return f"<Group id={self.id} name={self.name!r}>"
@@ -193,8 +149,7 @@ class Group(Base):
 
 class Channel(Base):
     """
-    A sub-space inside a Group where messages are actually posted
-    (e.g. Group "Study" → Channels "#math", "#physics").
+    A sub-space inside a Group where messages are posted.
 
     Relationships
     -------------
@@ -204,33 +159,14 @@ class Channel(Base):
 
     __tablename__ = "channels"
 
-    id = Column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
-        nullable=False,
-    )
-    name = Column(String(100), nullable=False)          # e.g. "general"
-    topic = Column(String(255), nullable=True)           # optional channel description
+    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
+    name       = Column(String(100), nullable=False)
+    topic      = Column(String(255), nullable=True)
+    group_id   = Column(UUID(as_uuid=True), ForeignKey("groups.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    group_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("groups.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    created_at = Column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
-    )
-
-    # ── Relationships ────────────────────────────────────────────────────────
-    group = relationship("Group", back_populates="channels")
-    messages = relationship(
-        "Message",
-        back_populates="channel",
-        cascade="all, delete-orphan",
-        lazy="dynamic",
-    )
+    group    = relationship("Group",   back_populates="channels")
+    messages = relationship("Message", back_populates="channel", cascade="all, delete-orphan", lazy="dynamic")
 
     def __repr__(self) -> str:
         return f"<Channel id={self.id} name={self.name!r} group_id={self.group_id}>"
@@ -244,6 +180,11 @@ class Message(Base):
     """
     A single chat message sent by a User inside a Channel.
 
+    Phase 6 additions
+    -----------------
+    is_edited  : set to True whenever content is updated via PUT /messages
+    updated_at : UTC timestamp of the most recent edit; None until first edit
+
     Relationships
     -------------
     • author  : Many-to-One → User
@@ -252,42 +193,31 @@ class Message(Base):
 
     __tablename__ = "messages"
 
-    id = Column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
-        nullable=False,
-    )
-    content = Column(Text, nullable=False)
+    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
+    content    = Column(Text, nullable=False)
 
-    # Soft-delete / edit tracking
+    # ── Lifecycle flags ───────────────────────────────────────────────────────
     is_deleted = Column(Boolean, nullable=False, default=False)
-    edited_at = Column(DateTime(timezone=True), nullable=True)
+    # edited_at is the ORIGINAL field kept from Phase 5 (backward compat)
+    edited_at  = Column(DateTime(timezone=True), nullable=True)
 
-    # ── Foreign Keys ─────────────────────────────────────────────────────────
-    author_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="SET NULL"),
-        nullable=True,      # keep message record even if user is deleted
-        index=True,
-    )
-    channel_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("channels.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
+    # ── Phase 6: new fields ───────────────────────────────────────────────────
+    is_edited  = Column(Boolean, nullable=False, default=False,
+                        comment="True after the message has been edited at least once.")
+    updated_at = Column(DateTime(timezone=True), nullable=True,
+                        comment="UTC timestamp of the most recent edit.")
 
-    created_at = Column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
-    )
+    # ── Foreign Keys ──────────────────────────────────────────────────────────
+    author_id  = Column(UUID(as_uuid=True), ForeignKey("users.id",    ondelete="SET NULL"),  nullable=True,  index=True)
+    channel_id = Column(UUID(as_uuid=True), ForeignKey("channels.id", ondelete="CASCADE"),   nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False,  index=True)
 
-    # ── Relationships ────────────────────────────────────────────────────────
-    author = relationship("User", back_populates="messages", lazy="joined")
+    # ── Relationships ─────────────────────────────────────────────────────────
+    author  = relationship("User",    back_populates="messages", lazy="joined")
     channel = relationship("Channel", back_populates="messages")
 
     def __repr__(self) -> str:
         return (
             f"<Message id={self.id} author_id={self.author_id} "
-            f"channel_id={self.channel_id}>"
+            f"channel_id={self.channel_id} edited={self.is_edited}>"
         )

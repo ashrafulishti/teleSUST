@@ -3,10 +3,21 @@
   main.py — FastAPI application entry point
   teleSUST Real-Time Group Chat Platform
 =============================================================================
+  CORS origins are now read from the ALLOWED_ORIGINS environment variable
+  instead of being hardcoded. No hosting URLs live in this file.
+
+  Format in .env:
+      ALLOWED_ORIGINS=https://tele-sust.vercel.app,http://localhost:5173
+  Multiple origins are comma-separated, no spaces.
+=============================================================================
 """
+
+import os
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
 from database import create_tables
 from routers import auth, channels, groups, messages, websocket
 
@@ -32,27 +43,27 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 # CORS
 # ---------------------------------------------------------------------------
-# allow_origins=["*"] is INVALID when allow_credentials=True.
-# The browser spec forbids wildcard origins on credentialed requests — it
-# silently drops the request body, FastAPI receives None, and Pydantic throws
-# "Input should be a valid dictionary or object to extract fields from."
-# Solution: list every domain the frontend is actually served from.
+# Origins are read from ALLOWED_ORIGINS env var — comma-separated, no spaces.
+# Falls back to localhost only if the variable is not set (local dev safety net).
+#
+# allow_origins=["*"] is INVALID when allow_credentials=True — the browser
+# spec forbids wildcard origins on credentialed requests.
+
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
+allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://tele-sust.vercel.app",   # production frontend (Vercel)
-        "http://localhost:5173",           # local Vite dev server
-        "http://127.0.0.1:5173",           # local Vite dev server (alternate)
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins     = allowed_origins,
+    allow_credentials = True,
+    allow_methods     = ["*"],
+    allow_headers     = ["*"],
 )
 
 # ---------------------------------------------------------------------------
 # Routers
 # ---------------------------------------------------------------------------
+
 app.include_router(auth.router,      prefix="/auth",                   tags=["Auth"])
 app.include_router(groups.router,    prefix="/groups",                 tags=["Groups"])
 app.include_router(
